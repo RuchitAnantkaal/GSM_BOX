@@ -1,0 +1,286 @@
+#include <HardwareSerial.h>
+#include <Arduino.h>
+// Configure Serial2 pins for GSM module
+#define RX2_PIN 16  // Adjust according to your wiring
+#define TX2_PIN 17  // Adjust according to your wiring
+#define GSM_BAUD 115200  // Set according to your GSM module baud rate
+bool isWebSocketConnected = false;
+// Global variables
+HardwareSerial GSMSerial(2); // Use Serial2 for GSM
+String response = "";
+unsigned long timeout = 1000; // Default timeout for responses
+unsigned long lastSendTime = 0;
+String serverIP = "65.1.56.164";
+int serverPort = 8765;
+
+const unsigned long SEND_INTERVAL = 5000; // Send data every 5 seconds
+
+// Function to send AT command and get response
+String sendATCommand(const char* command, unsigned long waitTime = 1000) {
+  response = "";
+  GSMSerial.println(command);
+  Serial.print("Sending: ");
+  Serial.println(command);
+  
+  unsigned long startTime = millis();
+  while ((millis() - startTime) < waitTime) {
+    while (GSMSerial.available()) {
+      char c = GSMSerial.read();
+      response += c;
+      Serial.write(c);  // Echo to Serial Monitor
+      delay(1); // Small delay to allow buffer to fill
+    }
+    // Check if we have a complete response
+    if (response.indexOf("OK") != -1 || response.indexOf("ERROR") != -1) {
+      break;
+    }
+  }
+  return response;
+}
+
+// Function to check device and network status (similar to previous implementation)
+bool initializeGSMModule() {
+  Serial.println("\n--- Initializing GSM Module ---");
+  
+  // Check device info
+  String atResponse = sendATCommand("AT");
+  if (atResponse.indexOf("OK") == -1) {
+    Serial.println("Error: Module not responding");
+    return false;
+  }
+  
+  // Check SIM and network
+  String simResponse = sendATCommand("AT+CPIN?");
+  if (simResponse.indexOf("+CPIN: READY") == -1) {
+    Serial.println("Error: SIM not ready");
+    return false;
+  }
+  
+  // Check network registration
+  String regResponse = sendATCommand("AT+CREG?");
+  if (regResponse.indexOf("+CREG: 0,1") == -1 && regResponse.indexOf("+CREG: 0,5") == -1) {
+    Serial.println("Error: Not registered to network");
+    return false;
+  }
+  
+  // Activate PDP context
+  if (sendATCommand("AT+CGACT=1,1", 10000).indexOf("OK") == -1) {
+    Serial.println("Error: Cannot activate PDP context");
+    return false;
+  }
+  
+  // Open network
+  if (sendATCommand("AT+NETOPEN", 10000).indexOf("OK") == -1) {
+    //Serial.println("Error: Cannot open network");
+    return false;
+  }
+  
+  return true;
+}
+
+// Establish WebSocket Connection
+bool establishWebSocketConnection() {
+  Serial.println("\n--- Establishing WebSocket Connection ---");
+  
+  // Close any existing connections
+  sendATCommand("AT+CIPCLOSE=0", 5000);
+  
+  // Open TCP connection
+  String wsOpenCmd = "AT+CIPOPEN=0,\"TCP\",\"" + serverIP + "\"," + String(serverPort);
+  String wsResponse = sendATCommand(wsOpenCmd.c_str(), 10000);
+  
+  if (wsResponse.indexOf("+CIPOPEN: 0,0") == -1) {
+    Serial.println("Error: Failed to open TCP connection");
+    return false;
+  }
+  
+  // Prepare WebSocket handshake
+  String wsHandshake = "GET / HTTP/1.1\r\n"
+                       "Host: " + serverIP + ":" + String(serverPort) + "\r\n"
+                       "Upgrade: websocket\r\n"
+                       "Connection: Upgrade\r\n"
+                       "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                       "Sec-WebSocket-Version: 13\r\n\r\n";
+  
+  // Send handshake
+  String sendCmd = "AT+CIPSEND=0," + String(wsHandshake.length());
+  String sendResponse = sendATCommand(sendCmd.c_str(), 5000);
+  
+  if (sendResponse.indexOf(">") != -1) {
+    GSMSerial.print(wsHandshake);
+    Serial.println("WebSocket handshake sent");
+    
+    // Wait for handshake response
+    unsigned long startTime = millis();
+    while ((millis() - startTime) < 10000) {
+      if (GSMSerial.available()) {
+        String handshakeResp = GSMSerial.readString();
+        Serial.println("Handshake Response: " + handshakeResp);
+        
+        // Check for successful handshake
+        if (handshakeResp.indexOf("HTTP/1.1 101") != -1) {
+          Serial.println("WebSocket handshake successful");
+          isWebSocketConnected = true;
+          return true;
+        }
+      }
+      delay(100);
+    }
+  }
+  
+  Serial.println("Error: WebSocket handshake failed");
+  isWebSocketConnected = false;
+  return false;
+}
+
+// Send WebSocket Data
+bool sendWebSocketData(const String& data) {
+  // Ensure connection is established
+  if (!isWebSocketConnected) {
+    Serial.println("WebSocket not connected. Attempting to reconnect...");
+    if (!establishWebSocketConnection()) {
+      Serial.println("Failed to reconnect");
+      return false;
+    }
+  }
+  
+  // Prepare WebSocket frame
+  uint8_t frameHeader[2];
+  frameHeader[0] = 0x81; // FIN bit set + Text frame
+  
+  size_t payloadLength = data.length();
+  if (payloadLength <= 125) {
+    frameHeader[1] = payloadLength;
+  } else if (payloadLength <= 65535) {
+    frameHeader[1] = 126;
+  } else {
+    frameHeader[1] = 127;
+  }
+  
+  // Calculate total frame size
+  size_t totalFrameLength = 2; // Basic frame header
+  if (payloadLength > 125 && payloadLength <= 65535) {
+    totalFrameLength += 2; // Extended payload length
+  } else if (payloadLength > 65535) {
+    totalFrameLength += 8; // 64-bit extended payload length
+  }
+  totalFrameLength += payloadLength;
+  
+  // Prepare send command
+  String sendCmd = "AT+CIPSEND=0," + String(totalFrameLength);
+  String sendResponse = sendATCommand(sendCmd.c_str(), 5000);
+  
+  if (sendResponse.indexOf(">") != -1) {
+    // Send frame header
+    GSMSerial.write(frameHeader[0]);
+    GSMSerial.write(frameHeader[1]);
+    
+    // Send extended length if needed
+    if (payloadLength > 125 && payloadLength <= 65535) {
+      GSMSerial.write((payloadLength >> 8) & 0xFF);
+      GSMSerial.write(payloadLength & 0xFF);
+    } else if (payloadLength > 65535) {
+      // 64-bit extended length 
+      for (int i = 7; i >= 0; i--) {
+        GSMSerial.write((payloadLength >> (i * 8)) & 0xFF);
+      }
+    }
+    
+    // Send payload
+    for (size_t i = 0; i < payloadLength; i++) {
+      GSMSerial.write(data[i]);
+    }
+    
+    // Add debug output
+    Serial.println("WebSocket frame details:");
+    Serial.print("Frame Header: 0x");
+    Serial.print(frameHeader[0], HEX);
+    Serial.print(" 0x");
+    Serial.println(frameHeader[1], HEX);
+    Serial.print("Payload Length: ");
+    Serial.println(payloadLength);
+    Serial.println("Payload: " + data);
+    
+    // Wait for send confirmation
+    unsigned long startTime = millis();
+    String sendConfirm = "";
+    while ((millis() - startTime) < 5000) {
+      if (GSMSerial.available()) {
+        sendConfirm = GSMSerial.readString();
+        Serial.println("Send Confirmation: " + sendConfirm);
+        
+        // Check for successful send
+        if (sendConfirm.indexOf("+CIPSEND:") != -1) {
+          Serial.println("WebSocket data sent successfully");
+          return true;
+        }
+      }
+      delay(10);
+    }
+    
+    Serial.println("Timeout waiting for send confirmation");
+  } else {
+    Serial.println("Failed to get send prompt");
+    Serial.println("Send response: " + sendResponse);
+  }
+  
+  Serial.println("Error: Failed to send WebSocket data");
+  return false;
+}
+
+void setup() {
+  // Initialize Serial for debugging
+  Serial.begin(115200);
+  while (!Serial) delay(10);
+  Serial.println("\nESP32 GSM WebSocket Client");
+  
+  // Initialize Serial2 for GSM module
+  GSMSerial.begin(GSM_BAUD, SERIAL_8N1, RX2_PIN, TX2_PIN);
+  delay(5000);  // Wait for GSM module to stabilize
+  
+  // Initialize GSM module
+  if (!initializeGSMModule()) {
+    Serial.println("Failed to initialize GSM module");
+    return;
+  }
+  
+  // Establish WebSocket connection
+  if (!establishWebSocketConnection()) {
+    Serial.println("Failed to establish WebSocket connection");
+    return;
+  }
+  
+  Serial.println("WebSocket initialization complete");
+}
+
+void loop() {
+  // Continuously send data at specified interval
+  unsigned long currentTime = millis();
+  
+  if (currentTime - lastSendTime >= SEND_INTERVAL) {
+    // Prepare JSON data
+    String jsonData = "{\"X\":\"100\"}";
+    
+    // Send WebSocket data
+    if (sendWebSocketData(jsonData)) {
+      lastSendTime = currentTime;
+    } else {
+      Serial.println("Failed to send data. Attempting to reconnect...");
+      isWebSocketConnected = false;
+      
+      // Attempt to re-establish connection
+      if (!establishWebSocketConnection()) {
+        Serial.println("Reconnection failed");
+        delay(5000);  // Wait before retrying
+      }
+    }
+  }
+  
+  // Optional: Check for incoming data
+  if (GSMSerial.available()) {
+    String incomingData = GSMSerial.readString();
+    Serial.println("Received: " + incomingData);
+  }
+  
+  delay(100);  // Small delay to prevent blocking
+}

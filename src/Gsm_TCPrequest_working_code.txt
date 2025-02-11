@@ -1,0 +1,256 @@
+#include <HardwareSerial.h>
+
+// Configure Serial2 pins for GSM module
+#define RX2_PIN 16  // Adjust according to your wiring
+#define TX2_PIN 17  // Adjust according to your wiring
+#define GSM_BAUD 115200  // Set according to your GSM module baud rate
+
+// Global variables
+HardwareSerial GSMSerial(2); // Use Serial2 for GSM
+String response = "";
+unsigned long timeout = 1000; // Default timeout for responses
+
+// Function to send AT command and get response
+String sendATCommand(const char* command, unsigned long waitTime = 1000) {
+  response = "";
+  GSMSerial.println(command);
+  Serial.print("Sending: ");
+  Serial.println(command);
+  
+  unsigned long startTime = millis();
+  while ((millis() - startTime) < waitTime) {
+    while (GSMSerial.available()) {
+      char c = GSMSerial.read();
+      response += c;
+      Serial.write(c);  // Echo to Serial Monitor
+      delay(1); // Small delay to allow buffer to fill
+    }
+    // Check if we have a complete response
+    if (response.indexOf("OK") != -1 || response.indexOf("ERROR") != -1) {
+      break;
+    }
+  }
+  return response;
+}
+
+// Function to check device information
+bool checkDeviceInfo() {
+  Serial.println("\n--- Checking Device Information ---");
+  
+  // Check if module is responding
+  String atResponse = sendATCommand("AT");
+  if (atResponse.indexOf("OK") == -1) {
+    Serial.println("Error: Module not responding");
+    return false;
+  }
+  
+  // Get module information
+  String modelResponse = sendATCommand("AT+CGMM"); // Model number
+  String fwResponse = sendATCommand("AT+CGMR");    // Firmware version
+  String imeiResponse = sendATCommand("AT+CGSN");  // IMEI number
+  
+  // Print device information
+  Serial.println("Model: " + modelResponse);
+  Serial.println("Firmware: " + fwResponse);
+  Serial.println("IMEI: " + imeiResponse);
+  
+  return true;
+}
+
+// Function to check SIM status
+bool checkSIMStatus() {
+  Serial.println("\n--- Checking SIM Status ---");
+  
+  // Check SIM card status
+  String simResponse = sendATCommand("AT+CPIN?");
+  if (simResponse.indexOf("+CPIN: READY") == -1) {
+    Serial.println("Error: SIM not ready");
+    return false;
+  }
+  
+  // Check signal quality
+  String signalResponse = sendATCommand("AT+CSQ");
+  if (signalResponse.indexOf("OK") == -1) {
+    Serial.println("Error: Cannot check signal quality");
+    return false;
+  }
+  
+  // Check network registration
+  String regResponse = sendATCommand("AT+CREG?");
+  if (regResponse.indexOf("+CREG: 0,1") == -1 && regResponse.indexOf("+CREG: 0,5") == -1) {
+    Serial.println("Error: Not registered to network");
+    return false;
+  }
+  
+  return true;
+}
+
+// Function to initialize network connection
+bool initializeNetwork() {
+  Serial.println("\n--- Initializing Network ---");
+  
+  // Check if already connected
+  String cgactStatus = sendATCommand("AT+CGACT?");
+  if (cgactStatus.indexOf("+CGACT: 1,1") == -1) {
+    // Activate PDP context if not already activated
+    if (sendATCommand("AT+CGACT=1,1", 10000).indexOf("OK") == -1) {
+      Serial.println("Error: Cannot activate PDP context");
+      return false;
+    }
+  }
+  
+  // Check network status
+  String netStatus = sendATCommand("AT+NETOPEN?");
+  
+  // If network is not opened, open it
+  if (netStatus.indexOf("+NETOPEN: 1") == -1) {
+    if (sendATCommand("AT+NETOPEN", 10000).indexOf("OK") == -1) {
+      // If we get "already opened" error, that's okay
+      if (response.indexOf("already opened") == -1) {
+        Serial.println("Error: Cannot open network");
+        return false;
+      }
+    }
+  }
+  
+  // Get and verify IP address
+  String ipResponse = sendATCommand("AT+IPADDR");
+  if (ipResponse.indexOf("+IPADDR:") == -1) {
+    Serial.println("Error: Cannot get IP address");
+    return false;
+  }
+  
+  Serial.println("Network initialization successful");
+  return true;
+}
+
+// Function to send HTTP request using TCP
+bool sendHTTPRequest() {
+  Serial.println("\n--- Sending HTTP Request ---");
+  
+  // Verify IP address
+  String ipResp = sendATCommand("AT+IPADDR");
+  if (ipResp.indexOf("+IPADDR:") == -1) {
+    Serial.println("Error: No IP address");
+    return false;
+  }
+  
+  // Open TCP connection
+  String tcpResponse = sendATCommand("AT+CIPOPEN=0,\"TCP\",\"httpbin.org\",80", 10000);
+  if (tcpResponse.indexOf("OK") == -1) {
+    Serial.println("Error: TCP connection failed");
+    return false;
+  }
+  
+  // Wait for connection confirmation
+  unsigned long startTime = millis();
+  while ((millis() - startTime) < 5000) {
+    if (GSMSerial.available()) {
+      String resp = GSMSerial.readString();
+      Serial.print(resp);
+      if (resp.indexOf("+CIPOPEN: 0,0") != -1) {
+        break;
+      }
+    }
+    delay(100);
+  }
+  
+  // Prepare and send HTTP request
+  const char* httpRequest = "GET /get?test=hello HTTP/1.1\r\nHost: httpbin.org\r\nConnection: close\r\n\r\n";
+  int requestLength = strlen(httpRequest);
+  
+  String sendCmd = "AT+CIPSEND=0," + String(requestLength);
+  String sendResponse = sendATCommand(sendCmd.c_str(), 5000);
+  
+  if (sendResponse.indexOf(">") != -1) {
+    // Send the actual HTTP request
+    Serial.println("Sending HTTP request data...");
+    GSMSerial.print(httpRequest);
+    
+    // Read response immediately after sending
+    startTime = millis();
+    bool responseComplete = false;
+    String fullResponse = "";
+    
+    while ((millis() - startTime) < 15000) {
+      if (GSMSerial.available()) {
+        char c = GSMSerial.read();
+        Serial.write(c);
+        fullResponse += c;
+        
+        // Check for end of response markers
+        if (fullResponse.indexOf("+IPCLOSE:") != -1) {
+            responseComplete = true;
+            Serial.println("\nResponse received and connection closed successfully");
+            break;
+        }
+      }
+      delay(1);
+    }
+    
+    return responseComplete;
+  } else {
+    Serial.println("Error: CIPSEND prompt not received");
+    return false;
+  }
+}
+
+void setup() {
+  // Initialize Serial for debugging
+  Serial.begin(115200);
+  while (!Serial) delay(10);
+  Serial.println("\nESP32 GSM HTTP Request Test");
+  
+  // Initialize Serial2 for GSM module
+  GSMSerial.begin(GSM_BAUD, SERIAL_8N1, RX2_PIN, TX2_PIN);
+  delay(1000);  // Wait for GSM module to stabilize
+  
+  // Start initialization sequence
+  int retries = 3;  // Number of retries for initialization
+  bool success = false;
+  
+  while (retries > 0 && !success) {
+    Serial.printf("\nInitialization attempt %d...\n", 4-retries);
+    
+    if (!checkDeviceInfo()) {
+      Serial.println("Failed to get device information");
+      retries--;
+      delay(1000);
+      continue;
+    }
+    
+    if (!checkSIMStatus()) {
+      Serial.println("Failed to check SIM status");
+      retries--;
+      delay(1000);
+      continue;
+    }
+    
+    if (!initializeNetwork()) {
+      Serial.println("Failed to initialize network");
+      retries--;
+      delay(1000);
+      continue;
+    }
+    
+    success = true;
+  }
+  
+  if (!success) {
+    Serial.println("\nFailed to initialize after 3 attempts");
+    return;
+  }
+  
+  // Send HTTP request
+  if (!sendHTTPRequest()) {
+    Serial.println("Failed to send HTTP request");
+    return;
+  }
+  
+  Serial.println("\nHTTP request sequence completed");
+}
+
+void loop() {
+  // Main loop - could add periodic status checks or repeat requests here
+  delay(1000);
+}

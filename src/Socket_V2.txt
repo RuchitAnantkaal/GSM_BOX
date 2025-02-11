@@ -1,0 +1,839 @@
+#include <HardwareSerial.h>
+#include <ArduinoJson.h>
+#define DEBUG_MODE
+// Configure Serial2 pins for GSM module
+#define RX2_PIN 16
+#define TX2_PIN 17
+#define GSM_BAUD 115200
+
+// WebSocket settings
+const char *WS_HOST = "65.1.56.164";
+const int WS_PORT = 8765;
+const char *WS_KEY = "dGhlIHNhbXBsZSBub25jZQ==";
+
+// WebSocket frame opcodes
+#define WS_OPCODE_TEXT 0x1
+#define WS_OPCODE_PING 0x9
+#define WS_OPCODE_PONG 0xA
+
+// Timing settings
+const unsigned long MESSAGE_INTERVAL = 10; // Send message every 1 second
+const unsigned long PING_INTERVAL = 15000; // Send ping every 15 seconds
+const unsigned long COMMAND_TIMEOUT = 1000; // AT command timeout
+const unsigned long RECONNECT_DELAY = 500; // Delay between reconnection attempts
+
+// Error handling settings
+const int MAX_RETRIES = 3;       // Maximum errors before reset
+const int MAX_INIT_ATTEMPTS = 3; // Maximum initialization attempts
+int errorCount = 0;              // Counter for errors
+unsigned long lastDataTime = 0;  // Track last successful data transfer
+
+// Global variables
+HardwareSerial GSMSerial(2);
+String response = "";
+unsigned long lastMessageTime = 0;
+unsigned long lastPingTime = 0;
+
+String sendATCommand(const char *command, unsigned long waitTime = COMMAND_TIMEOUT)
+{
+    response = "";
+    GSMSerial.println(command);
+
+// Minimal serial debugging
+#ifdef DEBUG_MODE
+    Serial.print("Sending: ");
+    Serial.println(command);
+#endif
+
+    unsigned long startTime = millis();
+    while ((millis() - startTime) < waitTime)
+    {
+        if (GSMSerial.available())
+        {
+            char c = GSMSerial.read();
+            response += c;
+
+            // Faster response check
+            if (response.endsWith("OK\r\n") || response.endsWith("ERROR\r\n"))
+            {
+                break;
+            }
+        }
+    }
+    return response;
+}
+
+// Function to perform software reset
+void softwareReset()
+{
+    Serial.println("Performing software reset...");
+    delay(1000);
+    ESP.restart();
+}
+
+// Function to check device information
+bool checkDeviceInfo()
+{
+    Serial.println("\n--- Checking Device Information ---");
+
+    // Try AT command multiple times
+    for (int i = 0; i < 3; i++)
+    {
+        String atResponse = sendATCommand("AT");
+        if (atResponse.indexOf("OK") != -1)
+        {
+            sendATCommand("AT+CGMM"); // Model
+            sendATCommand("AT+CGMR"); // Firmware
+            sendATCommand("AT+CGSN"); // IMEI
+            return true;
+        }
+        delay(1000);
+    }
+
+    Serial.println("Error: Module not responding");
+    return false;
+}
+
+// Function to check SIM status
+bool checkSIMStatus()
+{
+    Serial.println("\n--- Checking SIM Status ---");
+
+    String simResponse = sendATCommand("AT+CPIN?");
+    if (simResponse.indexOf("+CPIN: READY") == -1)
+    {
+        Serial.println("Error: SIM not ready");
+        return false;
+    }
+
+    sendATCommand("AT+CSQ"); // Signal quality
+    String regResponse = sendATCommand("AT+CREG?");
+    if (regResponse.indexOf("+CREG: 0,1") == -1 && regResponse.indexOf("+CREG: 0,5") == -1)
+    {
+        Serial.println("Error: Not registered to network");
+        return false;
+    }
+
+    return true;
+}
+
+bool isSignalQualityAdequate()
+{
+    String signalResponse = sendATCommand("AT+CSQ");
+    int signalStrength = signalResponse.substring(signalResponse.indexOf("+CSQ: ") + 6).toInt();
+    
+    #ifdef DEBUG_MODE
+    Serial.println("------- SIGNAL QUALITY CHECK -------");
+    Serial.printf("Raw Signal Response: %s\n", signalResponse.c_str());
+    Serial.printf("Signal Strength: %d\n", signalStrength);
+    Serial.println("-----------------------------------");
+    #endif
+
+    // Consider connection reliable if signal strength is above 10
+    // Typically, signal strength > 10 indicates usable signal
+    // 99 means no measurement available
+    return (signalStrength > 10 && signalStrength != 99);
+}
+// Function to initialize network connection
+bool initializeNetwork()
+{
+    Serial.println("\n--- Initializing Network ---");
+
+    // First, close any existing connections
+    sendATCommand("AT+CIPCLOSE=0", 1000);
+    sendATCommand("AT+NETCLOSE", 1000);
+    delay(1000);
+
+    // Check and activate PDP context
+    String cgactStatus = sendATCommand("AT+CGACT?");
+    if (cgactStatus.indexOf("+CGACT: 1,1") == -1)
+    {
+        for (int i = 0; i < 3; i++)
+        {
+            if (sendATCommand("AT+CGACT=1,1", 10000).indexOf("OK") != -1)
+            {
+                break;
+            }
+            if (i == 2)
+            {
+                Serial.println("Error: Cannot activate PDP context");
+                return false;
+            }
+            delay(1000);
+        }
+    }
+
+    // Open network
+    for (int i = 0; i < 3; i++)
+    {
+        sendATCommand("AT+NETOPEN", 10000);
+        String netStatus = sendATCommand("AT+NETOPEN?");
+        if (netStatus.indexOf("+NETOPEN: 1") != -1)
+        {
+            // Verify IP address
+            String ipResponse = sendATCommand("AT+IPADDR");
+            if (ipResponse.indexOf("+IPADDR:") != -1)
+            {
+                return true;
+            }
+        }
+        delay(1000);
+    }
+
+    Serial.println("Error: Cannot open network");
+    return false;
+}
+
+// Enhanced WebSocket Establishment
+bool establishWebSocket()
+{
+    static unsigned long lastSuccessfulConnection = 0;
+    static int connectionAttempts = 0;
+
+    #ifdef DEBUG_MODE
+    Serial.println("------- WEBSOCKET ESTABLISHMENT DETAILS -------");
+    #endif
+
+    // Check signal quality before attempting connection
+    if (!isSignalQualityAdequate())
+    {
+        #ifdef DEBUG_MODE
+        Serial.println("Insufficient Signal Quality. Delaying Connection Attempt.");
+        #endif
+        delay(5000 * (connectionAttempts + 1));  // Exponential backoff
+        connectionAttempts++;
+        return false;
+    }
+
+    // Open TCP connection
+    String cmd = "AT+CIPOPEN=0,\"TCP\",\"" + String(WS_HOST) + "\"," + String(WS_PORT);
+    
+    #ifdef DEBUG_MODE
+    Serial.println("Attempting TCP Connection: " + cmd);
+    #endif
+
+    String tcpResponse = sendATCommand(cmd.c_str(), 10000);
+    
+    #ifdef DEBUG_MODE
+    Serial.println("TCP Connection Response: " + tcpResponse);
+    #endif
+
+    if (tcpResponse.indexOf("OK") == -1)
+    {
+        #ifdef DEBUG_MODE
+        Serial.println("TCP Connection Failed");
+        Serial.println("Detailed Response: " + tcpResponse);
+        Serial.println("----------------------------------------");
+        #endif
+        connectionAttempts++;
+        return false;
+    }
+
+    // Wait for connection confirmation with timeout
+    unsigned long startTime = millis();
+    bool connectionConfirmed = false;
+    String connectionResponse = "";
+
+    while ((millis() - startTime) < 5000)
+    {
+        if (GSMSerial.available())
+        {
+            String resp = GSMSerial.readString();
+            connectionResponse += resp;
+            
+            #ifdef DEBUG_MODE
+            Serial.print("Connection Response: ");
+            Serial.println(resp);
+            #endif
+
+            if (resp.indexOf("+CIPOPEN: 0,0") != -1)
+            {
+                connectionConfirmed = true;
+                break;
+            }
+            
+            if (resp.indexOf("ERROR") != -1)
+            {
+                #ifdef DEBUG_MODE
+                Serial.println("Connection Error Received");
+                Serial.println("Detailed Error: " + resp);
+                #endif
+                connectionAttempts++;
+                return false;
+            }
+        }
+        delay(10);
+    }
+
+    if (!connectionConfirmed)
+    {
+        #ifdef DEBUG_MODE
+        Serial.println("TCP Connection Timeout");
+        Serial.println("Last Received Response: " + connectionResponse);
+        Serial.println("----------------------------------------");
+        #endif
+        connectionAttempts++;
+        return false;
+    }
+
+    // Create WebSocket handshake
+    String handshake = "GET / HTTP/1.1\r\n";
+    handshake += "Host: " + String(WS_HOST) + ":" + String(WS_PORT) + "\r\n";
+    handshake += "Upgrade: websocket\r\n";
+    handshake += "Connection: Upgrade\r\n";
+    handshake += "Sec-WebSocket-Key: " + String(WS_KEY) + "\r\n";
+    handshake += "Sec-WebSocket-Version: 13\r\n";
+    handshake += "\r\n";
+
+    // Send handshake with retry
+    for(int retry = 0; retry < 3; retry++)
+    {
+        #ifdef DEBUG_MODE
+        Serial.printf("WebSocket Handshake Attempt %d\n", retry + 1);
+        #endif
+
+        // Send handshake
+        String sendCmd = "AT+CIPSEND=0," + String(handshake.length());
+        if (sendATCommand(sendCmd.c_str(), 2000).indexOf(">") != -1)
+        {
+            GSMSerial.print(handshake);
+            
+            #ifdef DEBUG_MODE
+            Serial.println("Handshake Sent: ");
+            Serial.println(handshake);
+            #endif
+            
+            // Wait for handshake response
+            startTime = millis();
+            String handshakeResponse = "";
+            bool protocolsReceived = false;
+            
+            while ((millis() - startTime) < 5000)
+            {
+                if (GSMSerial.available())
+                {
+                    String resp = GSMSerial.readString();
+                    handshakeResponse += resp;
+                    
+                    #ifdef DEBUG_MODE
+                    Serial.print("Handshake Response: ");
+                    Serial.println(resp);
+                    #endif
+                    
+                    if (resp.indexOf("101 Switching Protocols") != -1)
+                    {
+                        protocolsReceived = true;
+                    }
+                    
+                    // Check for complete handshake with both conditions
+                    if (protocolsReceived && handshakeResponse.indexOf("Sec-WebSocket-Accept") != -1)
+                    {
+                        #ifdef DEBUG_MODE
+                        Serial.println("\nWebSocket connection established!");
+                        Serial.println("Handshake Complete: " + handshakeResponse);
+                        Serial.println("----------------------------------------");
+                        #endif
+                        
+                        lastDataTime = millis();
+                        connectionAttempts = 0;
+                        lastSuccessfulConnection = millis();
+                        return true;
+                    }
+                }
+                delay(10);
+            }
+        }
+        
+        delay(1000); // Wait before retry
+    }
+    
+    #ifdef DEBUG_MODE
+    Serial.println("WebSocket handshake failed");
+    Serial.println("----------------------------------------");
+    #endif
+    
+    connectionAttempts++;
+    return false;
+}
+// Enhanced Connection Validation
+bool isConnectionValid()
+{
+    #ifdef DEBUG_MODE
+    Serial.println("------- COMPREHENSIVE CONNECTION VALIDATION -------");
+    #endif
+
+    // Check module responsiveness
+    String atResponse = sendATCommand("AT");
+    if (atResponse.indexOf("OK") == -1)
+    {
+        #ifdef DEBUG_MODE
+        Serial.println("Module Not Responsive to AT Command");
+        Serial.println("AT Response: " + atResponse);
+        #endif
+        return false;
+    }
+
+    // Signal Quality Check
+    if (!isSignalQualityAdequate())
+    {
+        #ifdef DEBUG_MODE
+        Serial.println("Insufficient Signal Quality");
+        #endif
+        return false;
+    }
+
+    // Network Registration Check
+    String regStatus = sendATCommand("AT+CREG?");
+    bool isRegistered = (regStatus.indexOf("+CREG: 0,1") != -1 || regStatus.indexOf("+CREG: 0,5") != -1);
+    
+    #ifdef DEBUG_MODE
+    Serial.println("Network Registration Status: " + regStatus);
+    Serial.printf("Registered: %s\n", isRegistered ? "Yes" : "No");
+    #endif
+
+    if (!isRegistered)
+    {
+        return false;
+    }
+
+    // PDP Context Check
+    String pdpStatus = sendATCommand("AT+CGACT?");
+    bool isPDPActive = (pdpStatus.indexOf("+CGACT: 1,1") != -1);
+    
+    #ifdef DEBUG_MODE
+    Serial.println("PDP Context Status: " + pdpStatus);
+    Serial.printf("PDP Active: %s\n", isPDPActive ? "Yes" : "No");
+    #endif
+
+    if (!isPDPActive)
+    {
+        return false;
+    }
+
+    // Network Open Status Check
+    String netStatus = sendATCommand("AT+NETOPEN?");
+    bool isNetOpen = (netStatus.indexOf("+NETOPEN: 1") != -1);
+    
+    #ifdef DEBUG_MODE
+    Serial.println("Network Open Status: " + netStatus);
+    Serial.printf("Network Open: %s\n", isNetOpen ? "Yes" : "No");
+    Serial.println("------------------------------------------------");
+    #endif
+
+    return isNetOpen;
+}
+
+
+bool handleReconnection()
+{
+    Serial.println("Checking connection status...");
+
+    // Try to re-establish WebSocket directly
+    if (establishWebSocket())
+    {
+        errorCount = 0;
+        return true;
+    }
+
+    Serial.println("Connection invalid, performing full reset...");
+
+    // Close existing connections
+    sendATCommand("AT+CIPCLOSE=0", 1000);
+    sendATCommand("AT+NETCLOSE", 1000);
+    delay(RECONNECT_DELAY);
+
+    // Try full reconnection sequence
+    for (int i = 0; i < MAX_INIT_ATTEMPTS; i++)
+    {
+        Serial.printf("Reconnection attempt %d/%d\n", i + 1, MAX_INIT_ATTEMPTS);
+
+        if (initializeNetwork() && establishWebSocket())
+        {
+            errorCount = 0;
+            Serial.println("Reconnection successful");
+            return true;
+        }
+        delay(RECONNECT_DELAY);
+    }
+
+    Serial.println("Reconnection failed");
+    return false;
+}
+// Advanced Connection Error Handling
+void handleConnectionError()
+{
+    static int consecutiveFailures = 0;
+    errorCount++;
+    consecutiveFailures++;
+
+    #ifdef DEBUG_MODE
+    Serial.println("------- ADVANCED CONNECTION ERROR ANALYSIS -------");
+    Serial.printf("Error Count: %d\n", errorCount);
+    Serial.printf("Consecutive Failures: %d\n", consecutiveFailures);
+    
+    // Log comprehensive diagnostic information
+    String networkStatus = sendATCommand("AT+CREG?");
+    String pdpStatus = sendATCommand("AT+CGACT?");
+    String signalQuality = sendATCommand("AT+CSQ");
+    String netStatus = sendATCommand("AT+NETOPEN?");
+    
+    Serial.println("Network Registration: " + networkStatus);
+    Serial.println("PDP Context Status: " + pdpStatus);
+    Serial.println("Signal Quality: " + signalQuality);
+    Serial.println("Network Open Status: " + netStatus);
+    Serial.printf("Last Data Transfer Time: %lu ms ago\n", millis() - lastDataTime);
+    Serial.printf("Last Message Time: %lu ms ago\n", millis() - lastMessageTime);
+    Serial.println("------------------------------------------------");
+    #endif
+
+    // More aggressive reset if consecutive failures exceed threshold
+    const int MAX_CONSECUTIVE_FAILURES = 3;
+    if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES)
+    {
+        #ifdef DEBUG_MODE
+        Serial.println("CRITICAL: Excessive connection failures. Performing comprehensive reset.");
+        #endif
+
+        // Perform a more comprehensive radio reset
+        sendATCommand("AT+CFUN=0");  // Disable radio
+        delay(2000);
+        sendATCommand("AT+CFUN=1");  // Re-enable radio
+        
+        consecutiveFailures = 0;
+    }
+
+    // Close existing connections
+    sendATCommand("AT+CIPCLOSE=0", 1000);
+    sendATCommand("AT+NETCLOSE", 1000);
+    delay(1000);
+
+    // Attempt reconnection
+    for (int i = 0; i < MAX_INIT_ATTEMPTS; i++)
+    {
+        #ifdef DEBUG_MODE
+        Serial.printf("Reconnection Attempt %d/%d\n", i + 1, MAX_INIT_ATTEMPTS);
+        #endif
+
+        // Wait with exponential backoff
+        delay(1000 * (i + 1));
+
+        if (initializeNetwork() && establishWebSocket())
+        {
+            #ifdef DEBUG_MODE
+            Serial.println("Reconnection Successful");
+            #endif
+            errorCount = 0;
+            consecutiveFailures = 0;
+            return;
+        }
+    }
+
+    #ifdef DEBUG_MODE
+    Serial.println("CRITICAL: All Reconnection Attempts Failed");
+    #endif
+    
+    // Force reset if all attempts fail
+    errorCount = MAX_RETRIES;
+    softwareReset();
+}
+
+bool sendWebSocketFrame(const uint8_t *payload, size_t length, uint8_t opcode)
+{
+    if (length > 2048)
+    {
+        Serial.println("Payload chunk too large");
+        return false;
+    }
+
+    uint8_t *frame = new uint8_t[length + 14];
+    uint8_t maskKey[4];
+
+    for (int i = 0; i < 4; i++)
+        maskKey[i] = random(256);
+
+    frame[0] = 0x80 | (opcode & 0x0F);
+    frame[1] = 0x80 | (length & 0x7F);
+    memcpy(frame + 2, maskKey, 4);
+
+    if (length > 0 && payload != nullptr)
+    {
+        memcpy(frame + 6, payload, length);
+        for (size_t i = 0; i < length; i++)
+        {
+            frame[i + 6] ^= maskKey[i % 4];
+        }
+    }
+
+    char sendCmd[30];
+    snprintf(sendCmd, sizeof(sendCmd), "AT+CIPSEND=0,%d", 6 + length);
+
+    bool success = false;
+    String response = sendATCommand(sendCmd, 1500);
+    
+    if (response.indexOf(">") != -1)
+    {
+        GSMSerial.write(frame, 6 + length);
+        
+        unsigned long startTime = millis();
+        while ((millis() - startTime) < 3000)
+        {
+            if (GSMSerial.available())
+            {
+                String resp = GSMSerial.readString();
+                if (resp.indexOf("OK") != -1 && resp.indexOf("ERROR") == -1)
+                {
+                    lastDataTime = millis();
+                    success = true;
+                    break;
+                }
+                if (resp.indexOf("ERROR") != -1 || resp.indexOf("CIPERROR") != -1 || resp.indexOf("+IPCLOSE") != -1)
+                {
+                    success = false;
+                    break;
+                }
+            }
+        }
+    }
+
+    delete[] frame;
+
+    if (!success)
+    {
+        handleConnectionError();
+    }
+
+    return success;
+}
+bool sendMultipleSensorData(const String *names, const float *values, int dataCount)
+{
+    if (dataCount > 50)
+    {
+        Serial.println("Error: Maximum 50 data points allowed");
+        return false;
+    }
+
+    StaticJsonDocument<4096> doc;
+
+    for (int i = 0; i < dataCount; i++)
+    {
+        doc[names[i]] = values[i];
+    }
+
+    String jsonString;
+    jsonString.reserve(4096);
+    serializeJson(doc, jsonString);
+
+    Serial.print("JSON Length: ");
+    Serial.println(jsonString.length());
+
+    const int MAX_CHUNK_SIZE = 512;  // Reduced chunk size for better reliability
+
+    if (jsonString.length() > MAX_CHUNK_SIZE)
+    {
+        size_t offset = 0;
+        bool isFirstChunk = true;
+        
+        while (offset < jsonString.length())
+        {
+            // Replace min with direct comparison
+            size_t chunkSize = (jsonString.length() - offset) < MAX_CHUNK_SIZE ? 
+                              (jsonString.length() - offset) : MAX_CHUNK_SIZE;
+                              
+            String chunk = jsonString.substring(offset, offset + chunkSize);
+            
+            bool isLastChunk = (offset + chunkSize >= jsonString.length());
+            
+            uint8_t opcode = isFirstChunk ? WS_OPCODE_TEXT : 0x00;
+            bool success = sendWebSocketFrame(
+                (uint8_t *)chunk.c_str(),
+                chunk.length(),
+                opcode);
+
+            if (!success)
+            {
+                return false;
+            }
+            
+            offset += chunkSize;
+            isFirstChunk = false;
+            
+            // Small delay between chunks
+            if (!isLastChunk) delay(100);
+        }
+        return true;
+    }
+    
+    return sendWebSocketFrame(
+        (uint8_t *)jsonString.c_str(),
+        jsonString.length(),
+        WS_OPCODE_TEXT);
+}
+// Function to send custom data
+bool sendSensorData(const char *name, float value)
+{
+    StaticJsonDocument<64> doc;
+    doc["name"] = name;
+    doc["value"] = value;
+
+    String jsonString;
+    serializeJson(doc, jsonString);
+
+    return sendWebSocketFrame((uint8_t *)jsonString.c_str(), jsonString.length(), WS_OPCODE_TEXT);
+}
+
+void setup()
+{
+    Serial.begin(115200);
+    GSMSerial.begin(GSM_BAUD, SERIAL_8N1, RX2_PIN, TX2_PIN);
+    randomSeed(analogRead(0));
+    delay(1000); // Wait for GSM module to stabilize
+
+    Serial.println("\nESP32 GSM WebSocket Client Test");
+
+    // Initialize with retry attempts
+    bool initialized = false;
+    for (int i = 0; i < MAX_INIT_ATTEMPTS; i++)
+    {
+        Serial.printf("Initialization attempt %d/%d\n", i + 1, MAX_INIT_ATTEMPTS);
+
+        if (checkDeviceInfo() && checkSIMStatus() && initializeNetwork() && establishWebSocket())
+        {
+            initialized = true;
+            break;
+        }
+        delay(RECONNECT_DELAY);
+    }
+
+    if (!initialized)
+    {
+        Serial.println("Initialization failed after maximum attempts");
+        softwareReset();
+        return;
+    }
+
+    lastMessageTime = millis();
+    lastPingTime = millis();
+    lastDataTime = millis();
+}
+
+void loop()
+{
+    static bool connectionLost = false;
+    static unsigned long lastAvailableCheck = 0;
+    static unsigned long lastSignalCheck = 0;
+
+    // Periodic signal quality check
+    if (millis() - lastSignalCheck > 30000)  // Check every 30 seconds
+    {
+        #ifdef DEBUG_MODE
+        String signalQuality = sendATCommand("AT+CSQ");
+        Serial.println("------- PERIODIC SIGNAL CHECK -------");
+        Serial.println("Signal Quality: " + signalQuality);
+        Serial.println("--------------------------------------");
+        #endif
+        lastSignalCheck = millis();
+    }
+
+    // Handle incoming data
+    while (GSMSerial.available())
+    {
+        String data = GSMSerial.readString();
+        
+        #ifdef DEBUG_MODE
+        Serial.println("------- RECEIVED DATA -------");
+        Serial.println(data);
+        Serial.println("-----------------------------");
+        #endif
+
+        if (data.indexOf("+IPCLOSE") != -1 || data.indexOf("ERROR") != -1)
+        {
+            #ifdef DEBUG_MODE
+            Serial.println("Connection Closed or Error Detected");
+            Serial.println("Detailed Data: " + data);
+            #endif
+
+            connectionLost = true;
+            handleConnectionError();
+            return;
+        }
+
+        if (data.indexOf("ping") != -1)
+        {
+            if (!sendWebSocketFrame((uint8_t *)"pong", 4, WS_OPCODE_PONG))
+            {
+                #ifdef DEBUG_MODE
+                Serial.println("Failed to send PONG response");
+                #endif
+                connectionLost = true;
+                return;
+            }
+        }
+        
+        lastDataTime = millis();
+    }
+
+    // If connection was lost, skip sending data this cycle
+    if (connectionLost)
+    {
+        connectionLost = false;
+        lastMessageTime = millis();
+        return;
+    }
+
+    // Check for connection timeout
+    if (millis() - lastDataTime > 45000)
+    {
+        #ifdef DEBUG_MODE
+        Serial.println("------- CONNECTION TIMEOUT DETAILS -------");
+        Serial.printf("Time since last data: %lu ms\n", millis() - lastDataTime);
+        String signalQuality = sendATCommand("AT+CSQ");
+        Serial.println("Signal Quality: " + signalQuality);
+        String networkStatus = sendATCommand("AT+CREG?");
+        Serial.println("Network Status: " + networkStatus);
+        Serial.println("----------------------------------------");
+        #endif
+
+        connectionLost = true;
+        handleConnectionError();
+        return;
+    }
+
+    if (millis() - lastMessageTime >= MESSAGE_INTERVAL)
+    {
+        String sensorNames[16] = {"X0", "X1", "X2", "X3", "X4", "X5", "X6", "X7", 
+                                 "X8", "X9", "X10", "X11", "X12", "X13", "X14", "X15"};
+        float sensorValues[16] = {1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 
+                                 1.8, 1.9, 1.10, 1.11, 1.12, 1.13, 1.14, 1.15};
+        
+        bool success = false;
+        
+        Serial.println("Attempting to send multiple sensor data Batch 1...");
+        if (sendMultipleSensorData(sensorNames, sensorValues, 12))
+        {
+            Serial.println("Multiple sensor data sent successfully");
+            
+            Serial.println("Attempting to send multiple sensor data Batch 2...");
+            if (sendMultipleSensorData(sensorNames, sensorValues, 12))
+            {
+                Serial.println("Multiple sensor data sent successfully");
+                success = true;
+            }
+        }
+
+        if (!success)
+        {
+            connectionLost = true;
+        }
+        
+        lastMessageTime = millis();
+    }
+
+    if (millis() - lastPingTime >= PING_INTERVAL && !connectionLost)
+    {
+        if (!sendWebSocketFrame((uint8_t *)"ping", 4, WS_OPCODE_PING))
+        {
+            connectionLost = true;
+        }
+        lastPingTime = millis();
+    }
+}
